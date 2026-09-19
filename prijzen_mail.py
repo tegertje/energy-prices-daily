@@ -10,6 +10,11 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 
+# ============================================================
+# E-MAIL EN API-INSTELLINGEN
+# Deze waarden komen uit je GitHub Actions Secrets.
+# ============================================================
+
 EMAIL_TO = os.environ["EMAIL_TO"]
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
@@ -23,7 +28,43 @@ ZONE = "BE"
 API_BASE = "https://euenergy.live/api/v1"
 
 
+# ============================================================
+# LIFEPOWR BY TREVION - CONTRACTFORMULE
+#
+# Officiële tariefkaart:
+# (0,1 x Belpex 15 MTU + 1,3) x 1,06
+#
+# Belpex is in EUR/MWh.
+# De factor 1,06 is 6% btw.
+# ============================================================
+
+LIFEPOWR_BELPEX_FACTOR = 0.10
+LIFEPOWR_MARGIN_EUR_MWH = 1.30
+VAT_FACTOR = 1.06
+
+
+# ============================================================
+# ACTUELE COMPONENTEN UIT JE AUGUSTUS 2026-FACTUUR
+#
+# Deze prijzen worden apart gefactureerd.
+# Ze zijn opgenomen in het subtotaal energie hieronder.
+#
+# Groene stroom: 1,100 cEUR/kWh
+# WKK:            0,420 cEUR/kWh
+# ============================================================
+
+GREEN_ELECTRICITY_EUR_KWH = 0.01100
+WKK_EUR_KWH = 0.00420
+
+
 def get_prices(day_name):
+    """
+    Haalt de EPEX/Belpex-prijzen op voor 'today' of 'tomorrow'.
+    Geeft (records, error_message) terug.
+
+    De euenergy API antwoordt met status 425 als de prijzen voor
+    morgen nog niet gepubliceerd zijn.
+    """
     url = f"{API_BASE}/prices/{day_name}"
 
     response = requests.get(
@@ -56,6 +97,7 @@ def get_prices(day_name):
         if isinstance(records, list):
             return records, None
 
+        # Het daadwerkelijke euenergy-formaat gebruikt "hours".
         hours = data.get("hours")
 
         if isinstance(hours, list):
@@ -67,6 +109,10 @@ def get_prices(day_name):
 
 
 def get_datetime(record):
+    """
+    Zet een API-tijdstip om naar Europe/Brussels.
+    euenergy gebruikt normaal het veld 'ts'.
+    """
     value = (
         record.get("datetime")
         or record.get("timestamp")
@@ -95,6 +141,10 @@ def get_datetime(record):
 
 
 def get_price_eur_mwh(record):
+    """
+    Leest de marktprijs in EUR/MWh uit de API-respons.
+    euenergy gebruikt gewoonlijk het veld 'price'.
+    """
     for key in (
         "price_eur_mwh",
         "priceEurMwh",
@@ -108,36 +158,117 @@ def get_price_eur_mwh(record):
     raise ValueError(f"Geen prijs gevonden: {record}")
 
 
+def lifepowr_prices(spot_eur_mwh):
+    """
+    Berekent de prijscomponenten per kWh.
+
+    Returns:
+    - EPEX spotprijs in EUR/kWh
+    - LIFEPOWR dynamische energieprijs incl. 6% btw in EUR/kWh
+    - Groene stroom + WKK in EUR/kWh
+    - Subtotaal energie in EUR/kWh
+
+    Dit subtotaal is GEEN volledige factuurprijs:
+    netkosten, afnametarief, capaciteitstarief, vaste vergoeding,
+    accijnzen en eventuele FlexiO-vergoeding zitten er niet in.
+    """
+    spot_eur_kwh = spot_eur_mwh / 1000
+
+    lifepowr_energy_excl_vat_mwh = (
+        LIFEPOWR_BELPEX_FACTOR * spot_eur_mwh
+        + LIFEPOWR_MARGIN_EUR_MWH
+    )
+
+    lifepowr_energy_incl_vat_mwh = (
+        lifepowr_energy_excl_vat_mwh * VAT_FACTOR
+    )
+
+    lifepowr_energy_incl_vat_kwh = (
+        lifepowr_energy_incl_vat_mwh / 1000
+    )
+
+    green_and_wkk_kwh = (
+        GREEN_ELECTRICITY_EUR_KWH
+        + WKK_EUR_KWH
+    )
+
+    energy_subtotal_kwh = (
+        lifepowr_energy_incl_vat_kwh
+        + green_and_wkk_kwh
+    )
+
+    return (
+        spot_eur_kwh,
+        lifepowr_energy_incl_vat_kwh,
+        green_and_wkk_kwh,
+        energy_subtotal_kwh,
+    )
+
+
 def normalize_prices(records):
+    """
+    Maakt een gesorteerde lijst:
+    tijdstip, spot, LIFEPOWR-energie, groen+WKK, subtotaal.
+    """
     prices = []
 
     for record in records:
         timestamp = get_datetime(record)
-        price_kwh = get_price_eur_mwh(record) / 1000
-        prices.append((timestamp, price_kwh))
+        spot_eur_mwh = get_price_eur_mwh(record)
+
+        (
+            spot_eur_kwh,
+            lifepowr_energy,
+            green_and_wkk,
+            energy_subtotal,
+        ) = lifepowr_prices(spot_eur_mwh)
+
+        prices.append((
+            timestamp,
+            spot_eur_kwh,
+            lifepowr_energy,
+            green_and_wkk,
+            energy_subtotal,
+        ))
 
     return sorted(prices, key=lambda item: item[0])
 
 
 def make_text_section(title, prices, message=None):
+    """
+    Bouwt de leesbare tekstversie van de e-mail.
+    """
     if prices is None:
         return f"{title}\n{message}"
 
     lines = [
         title,
-        "Uur                  | Prijs (EUR/kWh)",
-        "---------------------|----------------",
+        (
+            "Uur                  | EPEX Spot | LIFEPOWR energie | "
+            "Groen+WKK | Subtotaal"
+        ),
+        (
+            "---------------------|-----------|-------------------|"
+            "-----------|----------"
+        ),
     ]
 
-    for timestamp, price_kwh in prices:
+    for timestamp, spot, lifepowr, green_wkk, subtotal in prices:
         lines.append(
-            f"{timestamp.strftime('%Y-%m-%d %H:%M')} | {price_kwh:.4f}"
+            f"{timestamp.strftime('%Y-%m-%d %H:%M')} | "
+            f"{spot:.4f} | "
+            f"{lifepowr:.4f} | "
+            f"{green_wkk:.4f} | "
+            f"{subtotal:.4f}"
         )
 
     return "\n".join(lines)
 
 
 def make_html_section(title, prices, message=None):
+    """
+    Bouwt de HTML-tabel voor Gmail.
+    """
     if prices is None:
         return f"""
         <h3>{html.escape(title)}</h3>
@@ -146,11 +277,14 @@ def make_html_section(title, prices, message=None):
 
     rows = []
 
-    for timestamp, price_kwh in prices:
+    for timestamp, spot, lifepowr, green_wkk, subtotal in prices:
         rows.append(
             "<tr>"
             f"<td>{html.escape(timestamp.strftime('%Y-%m-%d %H:%M'))}</td>"
-            f"<td>{price_kwh:.4f}</td>"
+            f"<td>{spot:.4f}</td>"
+            f"<td>{lifepowr:.4f}</td>"
+            f"<td>{green_wkk:.4f}</td>"
+            f"<td><b>{subtotal:.4f}</b></td>"
             "</tr>"
         )
 
@@ -160,7 +294,10 @@ def make_html_section(title, prices, message=None):
            style="border-collapse: collapse;">
       <tr>
         <th>Uur</th>
-        <th>Prijs (EUR/kWh)</th>
+        <th>EPEX Spot<br>(EUR/kWh)</th>
+        <th>LIFEPOWR energie<br>incl. 6% btw</th>
+        <th>Groene stroom<br>+ WKK</th>
+        <th>Subtotaal energie<br>(EUR/kWh)</th>
       </tr>
       {''.join(rows)}
     </table>
@@ -186,55 +323,59 @@ def main():
     )
 
     text_body = "\n\n".join([
-        "Dynamische stroomprijzen - Belgie (EPEX Spot)",
+        "Dynamische stroomprijzen Belgie - LIFEPOWR by Trevion",
         f"Opgehaald op {now.strftime('%Y-%m-%d %H:%M')} (Europe/Brussels)",
         "",
-        make_text_section(
-            "VANDAAG",
-            today_prices,
-            today_message,
-        ),
-        make_text_section(
-            "MORGEN",
-            tomorrow_prices,
-            tomorrow_message,
-        ),
+        make_text_section("VANDAAG", today_prices, today_message),
+        make_text_section("MORGEN", tomorrow_prices, tomorrow_message),
         "",
-        "Bron: euenergy.live (CC BY-4.0).",
+        "LIFEPOWR-formule incl. 6% btw:",
+        "(0.1 x Belpex 15 MTU + 1.3 EUR/MWh) x 1.06",
+        "",
+        "Groene stroom + WKK in deze raming: 0.0152 EUR/kWh.",
         (
-            "Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw, "
-            "heffingen of nettarieven."
+            "Het subtotaal omvat alleen: LIFEPOWR dynamische energieprijs "
+            "+ groene stroom + WKK."
         ),
+        (
+            "Niet inbegrepen: Fluvius-netkosten, afnametarief, "
+            "capaciteitstarief, vaste vergoeding, accijnzen, "
+            "energiefonds en eventuele FlexiO-vergoeding."
+        ),
+        "Bron EPEX: euenergy.live (CC BY-4.0).",
     ])
 
     html_body = f"""
     <html>
       <body>
-        <h2>Dynamische stroomprijzen - Belgie (EPEX Spot)</h2>
+        <h2>Dynamische stroomprijzen Belgie</h2>
         <p>
+          <b>LIFEPOWR by Trevion - prijsraming per uur</b><br>
           Opgehaald op {now.strftime('%Y-%m-%d %H:%M')}
           (Europe/Brussels).
         </p>
 
-        {make_html_section(
-            "Vandaag",
-            today_prices,
-            today_message,
-        )}
+        {make_html_section("Vandaag", today_prices, today_message)}
 
-        {make_html_section(
-            "Morgen",
-            tomorrow_prices,
-            tomorrow_message,
-        )}
+        {make_html_section("Morgen", tomorrow_prices, tomorrow_message)}
 
         <p>
           <small>
-            Bron:
-            <a href="https://euenergy.live/">euenergy.live</a>
-            (CC BY-4.0).<br>
-            Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw,
-            heffingen of nettarieven.
+            <b>LIFEPOWR-formule incl. 6% btw:</b><br>
+            (0.1 x Belpex 15 MTU + 1.3 EUR/MWh) x 1.06.<br><br>
+
+            <b>Groene stroom + WKK:</b> 0.0152 EUR/kWh,
+            op basis van je augustus 2026-factuur.<br><br>
+
+            <b>Subtotaal energie:</b> LIFEPOWR energieprijs
+            + groene stroom + WKK.<br>
+
+            Niet inbegrepen: Fluvius-netkosten, afnametarief,
+            capaciteitstarief, vaste vergoeding, accijnzen,
+            energiefonds en eventuele FlexiO-vergoeding.<br><br>
+
+            Bron EPEX:
+            <a href="https://euenergy.live/">euenergy.live</a> (CC BY-4.0).
           </small>
         </p>
       </body>
@@ -245,7 +386,7 @@ def main():
     message["From"] = EMAIL_FROM
     message["To"] = EMAIL_TO
     message["Subject"] = (
-        "Dynamische stroomprijzen Belgie - vandaag en morgen"
+        "LIFEPOWR by Trevion - dynamische prijzen vandaag en morgen"
     )
 
     message.attach(MIMEText(text_body, "plain", "utf-8"))

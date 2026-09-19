@@ -2,7 +2,7 @@ name: Daily energy prices email
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+- cron: "30 14 * * *"
   workflow_dispatch:
 
 jobs:

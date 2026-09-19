@@ -25,6 +25,7 @@ API_BASE = "https://euenergy.live/api/v1"
 
 def get_prices(day_name):
     url = f"{API_BASE}/prices/{day_name}"
+
     response = requests.get(
         url,
         params={"zone": ZONE},
@@ -32,26 +33,32 @@ def get_prices(day_name):
         timeout=30,
     )
     response.raise_for_status()
+
     data = response.json()
 
     if isinstance(data, list):
-        records = data
-    elif isinstance(data, dict):
+        return data
+
+    if isinstance(data, dict):
         records = (
             data.get("prices")
             or data.get("data")
             or data.get("results")
             or data.get("items")
         )
-    else:
-        records = None
 
-    if not isinstance(records, list):
-        raise ValueError(
-            f"Onverwacht antwoord van euenergy voor {day_name}: {data}"
-        )
+        if isinstance(records, list):
+            return records
 
-    return records
+        # euenergy.live geeft één object terug met de lijst onder "hours".
+        hours = data.get("hours")
+
+        if isinstance(hours, list):
+            return hours
+
+    raise ValueError(
+        f"Onverwacht antwoord van euenergy voor {day_name}: {data}"
+    )
 
 
 def get_datetime(record):
@@ -61,19 +68,23 @@ def get_datetime(record):
         or record.get("start")
         or record.get("time")
         or record.get("date")
+        or record.get("ts")
     )
 
     if value is None:
         raise ValueError(f"Geen tijdstip gevonden: {record}")
 
     if isinstance(value, (int, float)):
-        return dt.datetime.fromtimestamp(value, tz=dt.timezone.utc).astimezone(TIMEZONE)
+        return dt.datetime.fromtimestamp(
+            value,
+            tz=dt.timezone.utc,
+        ).astimezone(TIMEZONE)
 
     text = str(value).replace("Z", "+00:00")
     parsed = dt.datetime.fromisoformat(text)
 
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=TIMEZONE)
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
 
     return parsed.astimezone(TIMEZONE)
 
@@ -106,12 +117,14 @@ def normalize_prices(records):
 def make_text_section(title, prices):
     lines = [
         title,
-        "Uur                  | Prijs (€/kWh)",
-        "---------------------|--------------",
+        "Uur                  | Prijs (EUR/kWh)",
+        "---------------------|----------------",
     ]
 
     for timestamp, price_kwh in prices:
-        lines.append(f"{timestamp.strftime('%Y-%m-%d %H:%M')} | {price_kwh:.4f}")
+        lines.append(
+            f"{timestamp.strftime('%Y-%m-%d %H:%M')} | {price_kwh:.4f}"
+        )
 
     return "\n".join(lines)
 
@@ -129,10 +142,11 @@ def make_html_section(title, prices):
 
     return f"""
     <h3>{html.escape(title)}</h3>
-    <table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse">
+    <table border="1" cellpadding="5" cellspacing="0"
+           style="border-collapse: collapse;">
       <tr>
         <th>Uur</th>
-        <th>Prijs (€/kWh)</th>
+        <th>Prijs (EUR/kWh)</th>
       </tr>
       {''.join(rows)}
     </table>
@@ -146,26 +160,36 @@ def main():
     tomorrow_prices = normalize_prices(get_prices("tomorrow"))
 
     text_body = "\n\n".join([
-        "Dynamische stroomprijzen — België (EPEX Spot)",
+        "Dynamische stroomprijzen - Belgie (EPEX Spot)",
         f"Opgehaald op {now.strftime('%Y-%m-%d %H:%M')} (Europe/Brussels)",
         "",
         make_text_section("VANDAAG", today_prices),
         make_text_section("MORGEN", tomorrow_prices),
         "",
-        "Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw, heffingen of nettarieven.",
+        "Bron: euenergy.live (CC BY-4.0).",
+        (
+            "Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw, "
+            "heffingen of nettarieven."
+        ),
     ])
 
     html_body = f"""
     <html>
       <body>
-        <h2>Dynamische stroomprijzen — België (EPEX Spot)</h2>
+        <h2>Dynamische stroomprijzen - Belgie (EPEX Spot)</h2>
         <p>Opgehaald op {now.strftime('%Y-%m-%d %H:%M')} (Europe/Brussels).</p>
+
         {make_html_section("Vandaag", today_prices)}
+
         {make_html_section("Morgen", tomorrow_prices)}
-        <p><small>
-          Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw,
-          heffingen of nettarieven.
-        </small></p>
+
+        <p>
+          <small>
+            Bron: <a href="https://euenergy.live/">euenergy.live</a> (CC BY-4.0).<br>
+            Dit zijn EPEX Spot-marktprijzen, zonder Trevion-marge, btw,
+            heffingen of nettarieven.
+          </small>
+        </p>
       </body>
     </html>
     """
@@ -173,7 +197,10 @@ def main():
     message = MIMEMultipart("alternative")
     message["From"] = EMAIL_FROM
     message["To"] = EMAIL_TO
-    message["Subject"] = "Dynamische stroomprijzen België — vandaag en morgen"
+    message["Subject"] = (
+        "Dynamische stroomprijzen Belgie - vandaag en morgen"
+    )
+
     message.attach(MIMEText(text_body, "plain", "utf-8"))
     message.attach(MIMEText(html_body, "html", "utf-8"))
 

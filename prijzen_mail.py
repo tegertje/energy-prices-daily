@@ -132,4 +132,109 @@ def format_price(price):
 
 
 def create_text_report(title, data):
-    records =
+    records = records_from_response(data)
+    prices = []
+    lines = [title, "-" * len(title)]
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        timestamp = get_time(record)
+        price = get_price(record)
+
+        if price is not None:
+            prices.append(price)
+
+        lines.append(f"{timestamp}: {format_price(price)}")
+
+    if not prices:
+        lines.append("")
+        lines.append("Geen bruikbare prijsgegevens ontvangen.")
+        return "\n".join(lines)
+
+    average_price = sum(prices) / len(prices)
+
+    summary = [
+        "",
+        f"Aantal uren: {len(prices)}",
+        f"Minimum: {format_price(min(prices))}",
+        f"Maximum: {format_price(max(prices))}",
+        f"Gemiddelde: {format_price(average_price)}",
+    ]
+
+    return "\n".join(lines + summary)
+
+
+def send_email(subject, body):
+    email_to = get_secret("EMAIL_TO")
+    email_from = get_secret("EMAIL_FROM")
+    smtp_server = get_secret("SMTP_SERVER")
+    smtp_port = int(get_secret("SMTP_PORT"))
+    smtp_user = get_secret("SMTP_USER")
+    smtp_pass = get_secret("SMTP_PASS")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = email_from
+    message["To"] = email_to
+    message.set_content(body)
+
+    context = ssl.create_default_context()
+
+    print(f"E-mail versturen naar: {email_to}")
+    print(f"SMTP-server: {smtp_server}:{smtp_port}")
+
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(
+            smtp_server,
+            smtp_port,
+            context=context,
+            timeout=30,
+        ) as server:
+            server.login(smtp_user, smtp_pass)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(
+            smtp_server,
+            smtp_port,
+            timeout=30,
+        ) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(message)
+
+    print("E-mail succesvol verstuurd.")
+
+
+def main():
+    print("Start prijsdata-download")
+
+    today_data = get_prices("today")
+    tomorrow_data = get_prices("tomorrow")
+
+    today_report = create_text_report("Elektriciteitsprijzen België - vandaag", today_data)
+    tomorrow_report = create_text_report(
+        "Elektriciteitsprijzen België - morgen",
+        tomorrow_data,
+    )
+
+    created_at = datetime.now().strftime("%d-%m-%Y %H:%M")
+
+    email_body = (
+        "Dagelijkse elektriciteitsprijzen voor België (zone BE)\n\n"
+        f"{today_report}\n\n"
+        f"{tomorrow_report}\n\n"
+        f"Gegevensbron: euenergy.live\n"
+        f"Gegenereerd op: {created_at}"
+    )
+
+    subject = f"Elektriciteitsprijzen België - {datetime.now().strftime('%d-%m-%Y')}"
+
+    send_email(subject, email_body)
+
+
+if __name__ == "__main__":
+    main()

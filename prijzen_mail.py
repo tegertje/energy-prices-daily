@@ -28,7 +28,7 @@ def get_prices(day):
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "User-Agent": "github-energy-prices/1.0",
+        "User-Agent": "Mozilla/5.0",
     }
 
     print(f"Prijsdata downloaden voor: {day}")
@@ -43,25 +43,15 @@ def get_prices(day):
         timeout=TIMEOUT_SECONDS,
     )
 
-    print(f"API-status met Bearer-token: {response.status_code}")
+    print(f"API-status: {response.status_code}")
+    print(f"Content-Type: {response.headers.get('content-type', '')}")
 
-    if response.status_code in (401, 403):
-        print("Bearer-token geweigerd; probeer token als queryparameter.")
-
-        response = requests.get(
-            url,
-            params={
-                "zone": ZONE,
-                "token": token,
-            },
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "github-energy-prices/1.0",
-            },
-            timeout=TIMEOUT_SECONDS,
+    if "text/html" in response.headers.get("content-type", "").lower():
+        print("De API gaf HTML terug in plaats van JSON.")
+        print("Waarschijnlijk is de aanvraag door Cloudflare geblokkeerd.")
+        raise RuntimeError(
+            "euenergy.live retourneerde een Cloudflare-beveiligingspagina."
         )
-
-        print(f"API-status met query-token: {response.status_code}")
 
     if not response.ok:
         print(f"API-foutantwoord: {response.text[:500]}")

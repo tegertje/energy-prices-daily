@@ -7,7 +7,7 @@ from email.message import EmailMessage
 import requests
 
 
-API_BASE_URL = "https://euenergy.live/api/v1/prices"
+API_BASE_URL = "https://euenergy.live/api/v1/summary"
 ZONE = "BE"
 TIMEOUT_SECONDS = 30
 
@@ -202,8 +202,8 @@ def send_email(subject, body):
 def main():
     print("Start prijsdata-download")
 
-    today_data = get_prices("today")
-    tomorrow_data = get_prices("tomorrow")
+    today_data = get_prices("latest")
+    tomorrow_data = today_data
 
     today_report = create_text_report("Elektriciteitsprijzen België - vandaag", today_data)
     tomorrow_report = create_text_report(

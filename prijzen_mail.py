@@ -72,12 +72,29 @@ def get_tomorrow_prices():
 
     print(f"Prijsdata downloaden voor morgen: {tomorrow}")
 
-    return request_json(
-        f"{API_BASE_URL}/price_next_day",
-        params={
-            "bzn": "BE",
-        },
-    )
+    try:
+        return request_json(
+            f"{API_BASE_URL}/price_next_day",
+            params={
+                "bzn": "BE",
+            },
+        )
+
+    except requests.HTTPError as error:
+        response = error.response
+
+        if response is not None and response.status_code == 404:
+            print(
+                "Prijzen voor morgen zijn nog niet beschikbaar. "
+                "De e-mail wordt toch verstuurd."
+            )
+
+            return {
+                "unix_seconds": [],
+                "price": [],
+            }
+
+        raise
 
 
 def get_series(data):

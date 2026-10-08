@@ -58,7 +58,7 @@ def get_today_prices():
     return request_json(
         f"{API_BASE_URL}/price",
         params={
-            "country": COUNTRY,
+            "bzn": "BE",
             "start": today,
             "end": today,
         },
@@ -75,7 +75,7 @@ def get_tomorrow_prices():
     return request_json(
         f"{API_BASE_URL}/price_next_day",
         params={
-            "country": COUNTRY,
+            "bzn": "BE",
         },
     )
 

@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 import requests
 
 
-COUNTRY = "be"
-API_BASE_URL = "https://api.energy-charts.info/v2"
+API_BASE_URL = "https://api.energy-charts.info"
+BIDDING_ZONE = "BE"
 TIMEOUT_SECONDS = 30
 BELGIUM_TIMEZONE = ZoneInfo("Europe/Brussels")
 
@@ -44,39 +44,47 @@ def request_json(url, params=None):
     if "application/json" not in content_type:
         raise RuntimeError(
             "Energy-Charts gaf geen JSON terug. "
-            f"Content-Type ontvangen: {content_type}"
+            f"Ontvangen Content-Type: {content_type}"
         )
 
-    return response.json()
+    data = response.json()
+
+    if isinstance(data, dict):
+        print(f"API-velden: {list(data.keys())}")
+
+    return data
 
 
-def get_today_prices():
-    today = datetime.now(BELGIUM_TIMEZONE).date().isoformat()
+def get_prices_for_date(date_value):
+    date_text = date_value.isoformat()
 
-    print(f"Prijsdata downloaden voor vandaag: {today}")
+    print(f"Prijsdata downloaden voor: {date_text}")
 
     return request_json(
         f"{API_BASE_URL}/price",
         params={
-            "bzn": "BE",
-            "start": today,
-            "end": today,
+            "bzn": BIDDING_ZONE,
+            "start": date_text,
+            "end": date_text,
         },
     )
 
 
-def get_tomorrow_prices():
-    tomorrow = (
-        datetime.now(BELGIUM_TIMEZONE).date() + timedelta(days=1)
-    ).isoformat()
+def empty_price_data():
+    return {
+        "unix_seconds": [],
+        "price": [],
+    }
 
-    print(f"Prijsdata downloaden voor morgen: {tomorrow}")
+
+def get_tomorrow_prices(tomorrow_date):
+    print(f"Prijsdata downloaden voor morgen: {tomorrow_date.isoformat()}")
 
     try:
         return request_json(
             f"{API_BASE_URL}/price_next_day",
             params={
-                "bzn": "BE",
+                "bzn": BIDDING_ZONE,
             },
         )
 
@@ -85,14 +93,11 @@ def get_tomorrow_prices():
 
         if response is not None and response.status_code == 404:
             print(
-                "Prijzen voor morgen zijn nog niet beschikbaar. "
+                "Prijzen voor morgen zijn nog niet gepubliceerd. "
                 "De e-mail wordt toch verstuurd."
             )
 
-            return {
-                "unix_seconds": [],
-                "price": [],
-            }
+            return empty_price_data()
 
         raise
 
@@ -101,43 +106,66 @@ def get_series(data):
     if not isinstance(data, dict):
         raise ValueError("Onverwacht antwoordformaat van Energy-Charts.")
 
-    timestamps = (
-        data.get("unix_seconds")
-        or data.get("timestamps")
-        or data.get("time")
-        or []
-    )
+    timestamps = data.get("unix_seconds")
 
-    prices = (
-        data.get("price")
-        or data.get("values")
-        or data.get("data")
-        or []
-    )
+    if timestamps is None:
+        timestamps = data.get("timestamps")
+
+    if timestamps is None:
+        timestamps = data.get("time")
+
+    if timestamps is None:
+        timestamps = []
+
+    prices = data.get("price")
+
+    if prices is None:
+        prices = data.get("values")
+
+    if prices is None:
+        prices = data.get("data")
 
     if isinstance(prices, dict):
-        prices = (
-            prices.get("price")
-            or prices.get("values")
-            or []
-        )
+        prices = prices.get("price")
 
-    if not isinstance(timestamps, list) or not isinstance(prices, list):
-        raise ValueError("Tijdstempels of prijswaarden ontbreken in de API-respons.")
+        if prices is None:
+            prices = prices.get("values")
+
+        if prices is None:
+            prices = prices.get("data")
+
+    if timestamps is None:
+        timestamps = []
+
+    if prices is None:
+        prices = []
+
+    if not isinstance(timestamps, list):
+        timestamps = list(timestamps)
+
+    if not isinstance(prices, list):
+        prices = list(prices)
+
+    print(f"Aantal timestamps: {len(timestamps)}")
+    print(f"Aantal prijzen: {len(prices)}")
 
     return timestamps, prices
 
 
 def format_timestamp(timestamp):
     try:
-        value = float(timestamp)
+        timestamp_value = float(timestamp)
 
-        if value > 10_000_000_000:
-            value = value / 1000
+        if timestamp_value > 10_000_000_000:
+            timestamp_value = timestamp_value / 1000
 
-        dt = datetime.fromtimestamp(value, tz=BELGIUM_TIMEZONE)
+        local_time = datetime.fromtimestamp(
+            timestamp_value,
+            tz=BELGIUM_TIMEZONE,
+        )
 
-        return dt.strftime("%d-%m-%Y %H:%M")
+        return local_time.strftime("%d-%m-%Y %H:%M")
+
     except (TypeError, ValueError, OSError, OverflowError):
         return str(timestamp)
 
@@ -153,11 +181,15 @@ def format_price(price):
 
 
 def create_text_report(title, data):
-    timestamps, raw_prices = get_series(data)
+    timestamps, prices = get_series(data)
 
-    lines = [title, "=" * len(title)]
+    lines = [
+        title,
+        "=" * len(title),
+    ]
+
     numeric_prices = []
-    row_count = min(len(timestamps), len(raw_prices))
+    row_count = min(len(timestamps), len(prices))
 
     if row_count == 0:
         lines.append("Geen prijsgegevens ontvangen.")
@@ -165,25 +197,29 @@ def create_text_report(title, data):
 
     for index in range(row_count):
         timestamp = format_timestamp(timestamps[index])
-        price = raw_prices[index]
+        raw_price = prices[index]
 
         try:
-            numeric_price = float(price)
-            numeric_prices.append(numeric_price)
-            price_text = format_price(numeric_price)
-        except (TypeError, ValueError):
+            price = float(raw_price)
+            numeric_prices.append(price)
             price_text = format_price(price)
+        except (TypeError, ValueError):
+            price_text = format_price(raw_price)
 
         lines.append(f"{timestamp}: {price_text}")
 
-    if numeric_prices:
-        average_price = sum(numeric_prices) / len(numeric_prices)
-
+    if not numeric_prices:
         lines.append("")
-        lines.append(f"Aantal intervallen: {len(numeric_prices)}")
-        lines.append(f"Minimum: {format_price(min(numeric_prices))}")
-        lines.append(f"Maximum: {format_price(max(numeric_prices))}")
-        lines.append(f"Gemiddelde: {format_price(average_price)}")
+        lines.append("Geen bruikbare numerieke prijzen ontvangen.")
+        return "\n".join(lines)
+
+    average_price = sum(numeric_prices) / len(numeric_prices)
+
+    lines.append("")
+    lines.append(f"Aantal intervallen: {len(numeric_prices)}")
+    lines.append(f"Minimum: {format_price(min(numeric_prices))}")
+    lines.append(f"Maximum: {format_price(max(numeric_prices))}")
+    lines.append(f"Gemiddelde: {format_price(average_price)}")
 
     return "\n".join(lines)
 
@@ -233,14 +269,17 @@ def send_email(subject, body):
 
 def main():
     now = datetime.now(BELGIUM_TIMEZONE)
-    today_label = now.strftime("%d-%m-%Y")
-    tomorrow_label = (now + timedelta(days=1)).strftime("%d-%m-%Y")
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    today_label = today_date.strftime("%d-%m-%Y")
+    tomorrow_label = tomorrow_date.strftime("%d-%m-%Y")
 
     print("Start Energy-Charts prijsdata-download")
-    print(f"Land: {COUNTRY}")
+    print(f"Biedzone: {BIDDING_ZONE}")
 
-    today_data = get_today_prices()
-    tomorrow_data = get_tomorrow_prices()
+    today_data = get_prices_for_date(today_date)
+    tomorrow_data = get_tomorrow_prices(tomorrow_date)
 
     today_report = create_text_report(
         f"Elektriciteitsprijzen België - vandaag ({today_label})",
@@ -252,7 +291,7 @@ def main():
         tomorrow_data,
     )
 
-    created_at = now.strftime("%d-%m-%Y %H:%M %Z")
+    generated_at = now.strftime("%d-%m-%Y %H:%M %Z")
 
     email_body = (
         "Dagelijkse day-ahead elektriciteitsprijzen voor België.\n"
@@ -260,7 +299,7 @@ def main():
         f"{today_report}\n\n"
         f"{tomorrow_report}\n\n"
         "Gegevensbron: Energy-Charts / Fraunhofer ISE.\n"
-        f"Gegenereerd op: {created_at}"
+        f"Gegenereerd op: {generated_at}"
     )
 
     subject = f"Elektriciteitsprijzen België - {today_label}"

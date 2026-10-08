@@ -1,159 +1,174 @@
 import os
 import ssl
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 
 import requests
 
 
-API_BASE_URL = "https://euenergy.live/api/v1/summary"
-ZONE = "BE"
+COUNTRY = "be"
+API_BASE_URL = "https://api.energy-charts.info/v2"
 TIMEOUT_SECONDS = 30
+BELGIUM_TIMEZONE = ZoneInfo("Europe/Brussels")
 
 
 def get_secret(name):
     value = os.getenv(name, "").strip()
 
     if not value:
-        raise RuntimeError(f"Secret ontbreekt of is leeg: {name}")
+        raise RuntimeError(f"GitHub Secret ontbreekt of is leeg: {name}")
 
     return value
 
 
-def get_prices(day):
-    token = get_secret("EUENERGY_TOKEN")
-    url = f"{API_BASE_URL}/{day}"
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    print(f"Prijsdata downloaden voor: {day}")
-    print(f"Zone: {ZONE}")
-    print(f"Token aanwezig: {bool(token)}")
-    print(f"Tokenlengte: {len(token)}")
-
+def request_json(url, params=None):
     response = requests.get(
         url,
-        params={"zone": ZONE},
-        headers=headers,
+        params=params,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "energy-prices-daily-github-action/1.0",
+        },
         timeout=TIMEOUT_SECONDS,
     )
 
+    print(f"URL: {response.url}")
     print(f"API-status: {response.status_code}")
-    print(f"Content-Type: {response.headers.get('content-type', '')}")
 
-    if "text/html" in response.headers.get("content-type", "").lower():
-        print("De API gaf HTML terug in plaats van JSON.")
-        print("Waarschijnlijk is de aanvraag door Cloudflare geblokkeerd.")
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+
+    if "application/json" not in content_type:
         raise RuntimeError(
-            "euenergy.live retourneerde een Cloudflare-beveiligingspagina."
+            "Energy-Charts gaf geen JSON terug. "
+            f"Content-Type ontvangen: {content_type}"
         )
-
-    if not response.ok:
-        print(f"API-foutantwoord: {response.text[:500]}")
-        response.raise_for_status()
 
     return response.json()
 
 
-def records_from_response(data):
-    if isinstance(data, list):
-        return data
+def get_today_prices():
+    today = datetime.now(BELGIUM_TIMEZONE).date().isoformat()
 
-    if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            return data["data"]
+    print(f"Prijsdata downloaden voor vandaag: {today}")
 
-        if isinstance(data.get("prices"), list):
-            return data["prices"]
-
-        return [data]
-
-    return []
-
-
-def get_price(record):
-    candidate_keys = [
-        "price",
-        "value",
-        "eur_per_mwh",
-        "price_eur_mwh",
-        "eurMwh",
-        "marketprice",
-    ]
-
-    for key in candidate_keys:
-        if key in record:
-            try:
-                return float(record[key])
-            except (TypeError, ValueError):
-                pass
-
-    return None
+    return request_json(
+        f"{API_BASE_URL}/price",
+        params={
+            "country": COUNTRY,
+            "start": today,
+            "end": today,
+        },
+    )
 
 
-def get_time(record):
-    candidate_keys = [
-        "datetime",
-        "timestamp",
-        "time",
-        "start",
-        "start_time",
-        "period_start",
-        "from",
-    ]
+def get_tomorrow_prices():
+    tomorrow = (
+        datetime.now(BELGIUM_TIMEZONE).date() + timedelta(days=1)
+    ).isoformat()
 
-    for key in candidate_keys:
-        if record.get(key):
-            return str(record[key])
+    print(f"Prijsdata downloaden voor morgen: {tomorrow}")
 
-    return "Onbekend"
+    return request_json(
+        f"{API_BASE_URL}/price_next_day",
+        params={
+            "country": COUNTRY,
+        },
+    )
+
+
+def get_series(data):
+    if not isinstance(data, dict):
+        raise ValueError("Onverwacht antwoordformaat van Energy-Charts.")
+
+    timestamps = (
+        data.get("unix_seconds")
+        or data.get("timestamps")
+        or data.get("time")
+        or []
+    )
+
+    prices = (
+        data.get("price")
+        or data.get("values")
+        or data.get("data")
+        or []
+    )
+
+    if isinstance(prices, dict):
+        prices = (
+            prices.get("price")
+            or prices.get("values")
+            or []
+        )
+
+    if not isinstance(timestamps, list) or not isinstance(prices, list):
+        raise ValueError("Tijdstempels of prijswaarden ontbreken in de API-respons.")
+
+    return timestamps, prices
+
+
+def format_timestamp(timestamp):
+    try:
+        value = float(timestamp)
+
+        if value > 10_000_000_000:
+            value = value / 1000
+
+        dt = datetime.fromtimestamp(value, tz=BELGIUM_TIMEZONE)
+
+        return dt.strftime("%d-%m-%Y %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(timestamp)
 
 
 def format_price(price):
     if price is None:
         return "geen prijs"
 
-    return f"EUR {price:.2f}/MWh"
+    try:
+        return f"EUR {float(price):.2f}/MWh"
+    except (TypeError, ValueError):
+        return str(price)
 
 
 def create_text_report(title, data):
-    records = records_from_response(data)
-    prices = []
-    lines = [title, "-" * len(title)]
+    timestamps, raw_prices = get_series(data)
 
-    for record in records:
-        if not isinstance(record, dict):
-            continue
+    lines = [title, "=" * len(title)]
+    numeric_prices = []
+    row_count = min(len(timestamps), len(raw_prices))
 
-        timestamp = get_time(record)
-        price = get_price(record)
-
-        if price is not None:
-            prices.append(price)
-
-        lines.append(f"{timestamp}: {format_price(price)}")
-
-    if not prices:
-        lines.append("")
-        lines.append("Geen bruikbare prijsgegevens ontvangen.")
+    if row_count == 0:
+        lines.append("Geen prijsgegevens ontvangen.")
         return "\n".join(lines)
 
-    average_price = sum(prices) / len(prices)
+    for index in range(row_count):
+        timestamp = format_timestamp(timestamps[index])
+        price = raw_prices[index]
 
-    summary = [
-        "",
-        f"Aantal uren: {len(prices)}",
-        f"Minimum: {format_price(min(prices))}",
-        f"Maximum: {format_price(max(prices))}",
-        f"Gemiddelde: {format_price(average_price)}",
-    ]
+        try:
+            numeric_price = float(price)
+            numeric_prices.append(numeric_price)
+            price_text = format_price(numeric_price)
+        except (TypeError, ValueError):
+            price_text = format_price(price)
 
-    return "\n".join(lines + summary)
+        lines.append(f"{timestamp}: {price_text}")
+
+    if numeric_prices:
+        average_price = sum(numeric_prices) / len(numeric_prices)
+
+        lines.append("")
+        lines.append(f"Aantal intervallen: {len(numeric_prices)}")
+        lines.append(f"Minimum: {format_price(min(numeric_prices))}")
+        lines.append(f"Maximum: {format_price(max(numeric_prices))}")
+        lines.append(f"Gemiddelde: {format_price(average_price)}")
+
+    return "\n".join(lines)
 
 
 def send_email(subject, body):
@@ -170,7 +185,7 @@ def send_email(subject, body):
     message["To"] = email_to
     message.set_content(body)
 
-    context = ssl.create_default_context()
+    ssl_context = ssl.create_default_context()
 
     print(f"E-mail versturen naar: {email_to}")
     print(f"SMTP-server: {smtp_server}:{smtp_port}")
@@ -179,7 +194,7 @@ def send_email(subject, body):
         with smtplib.SMTP_SSL(
             smtp_server,
             smtp_port,
-            context=context,
+            context=ssl_context,
             timeout=30,
         ) as server:
             server.login(smtp_user, smtp_pass)
@@ -191,7 +206,7 @@ def send_email(subject, body):
             timeout=30,
         ) as server:
             server.ehlo()
-            server.starttls(context=context)
+            server.starttls(context=ssl_context)
             server.ehlo()
             server.login(smtp_user, smtp_pass)
             server.send_message(message)
@@ -200,28 +215,38 @@ def send_email(subject, body):
 
 
 def main():
-    print("Start prijsdata-download")
+    now = datetime.now(BELGIUM_TIMEZONE)
+    today_label = now.strftime("%d-%m-%Y")
+    tomorrow_label = (now + timedelta(days=1)).strftime("%d-%m-%Y")
 
-    today_data = get_prices("latest")
-    tomorrow_data = today_data
+    print("Start Energy-Charts prijsdata-download")
+    print(f"Land: {COUNTRY}")
 
-    today_report = create_text_report("Elektriciteitsprijzen België - vandaag", today_data)
+    today_data = get_today_prices()
+    tomorrow_data = get_tomorrow_prices()
+
+    today_report = create_text_report(
+        f"Elektriciteitsprijzen België - vandaag ({today_label})",
+        today_data,
+    )
+
     tomorrow_report = create_text_report(
-        "Elektriciteitsprijzen België - morgen",
+        f"Elektriciteitsprijzen België - morgen ({tomorrow_label})",
         tomorrow_data,
     )
 
-    created_at = datetime.now().strftime("%d-%m-%Y %H:%M")
+    created_at = now.strftime("%d-%m-%Y %H:%M %Z")
 
     email_body = (
-        "Dagelijkse elektriciteitsprijzen voor België (zone BE)\n\n"
+        "Dagelijkse day-ahead elektriciteitsprijzen voor België.\n"
+        "Eenheid: EUR per MWh.\n\n"
         f"{today_report}\n\n"
         f"{tomorrow_report}\n\n"
-        f"Gegevensbron: euenergy.live\n"
+        "Gegevensbron: Energy-Charts / Fraunhofer ISE.\n"
         f"Gegenereerd op: {created_at}"
     )
 
-    subject = f"Elektriciteitsprijzen België - {datetime.now().strftime('%d-%m-%Y')}"
+    subject = f"Elektriciteitsprijzen België - {today_label}"
 
     send_email(subject, email_body)
 
